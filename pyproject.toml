@@ -1,0 +1,24 @@
+[project]
+name = "machine-learning-iii-practica3"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "box2d>=2.3.10",
+    "gymnasium>=1.2.2",
+    "pygame>=2.6.1",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch_cu130" }
+torchvision = { index = "pytorch_cu130" }
+torchaudio = { index = "pytorch_cu130" }
+
+[[tool.uv.index]]
+name = "pytorch_cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
