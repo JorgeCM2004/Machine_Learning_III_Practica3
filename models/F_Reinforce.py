@@ -5,44 +5,44 @@ from torch.distributions import Categorical
 
 
 class Reinforce:
-	def __init__(self, obs_dim, n_actions, lr=1e-3, gamma=0.99):
-		"""
-		1. Constructor: Define e inicializa atributos y la red neuronal.
-		"""
+	def __init__(self, env, lr=1e-3, gamma=0.99):
 		self.gamma = gamma
 		self.lr = lr
 		self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+		self.obs_dim = env.observation_space.shape[0]
+		self.n_actions = env.action_space.n
+
 		self.policy_net = nn.Sequential(
-			nn.Linear(obs_dim, 128),
+			nn.Linear(self.obs_dim, 256),
 			nn.ReLU(),
-			nn.Linear(128, 64),
+			nn.Linear(256, 256),
 			nn.ReLU(),
-			nn.Linear(64, n_actions),
+			nn.Linear(256, self.n_actions),
+			nn.Sigmoid(),
 		).to(self.device)
 
 		self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
 
-	def act(self, state):
-		"""
-		2. Método act: Recibe un estado y selecciona una acción.
-		"""
+	def act(self, state, eval_mode=False):
 		state_t = torch.from_numpy(state).float().to(self.device)
 		logits = self.policy_net(state_t)
+
+		if eval_mode:
+			return torch.argmax(logits).item(), None
+
 		dist = Categorical(logits=logits)
 		action = dist.sample()
-		log_prob = dist.log_prob(action)
+		return action.item(), (dist.log_prob(action), dist.entropy())
 
-		return action.item(), log_prob
-
-	def update(self, log_probs, rewards):
+	def update(self, trajectory_data, rewards):
 		"""
-		3. Método update: Realiza la optimización de la red.
-
-		Args:
-		    log_probs: Lista de log_probs guardados durante el episodio.
-		    rewards: Lista de recompensas obtenidas en cada paso del episodio.
+		trajectory_data: Lista de tuplas (log_prob, entropy)
+		rewards: Lista de recompensas
 		"""
+		log_probs = [item[0] for item in trajectory_data]
+		entropies = [item[1] for item in trajectory_data]
+
 		returns = []
 		G = 0
 		for r in reversed(rewards):
@@ -50,14 +50,23 @@ class Reinforce:
 			returns.insert(0, G)
 
 		returns = torch.tensor(returns).to(self.device)
-		returns = (returns - returns.mean()) / (returns.std() + 1e-9)
 
-		loss = 0
-		for log_prob, G_t in zip(log_probs, returns):
-			loss += -log_prob * G_t
+		if len(returns) > 1:
+			returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+		policy_loss = 0
+		entropy_loss = 0
+
+		ent_coef = 0.01
+
+		for log_prob, entropy, G_t in zip(log_probs, entropies, returns):
+			policy_loss += -log_prob * G_t
+			entropy_loss += -entropy
+
+		total_loss = policy_loss + (ent_coef * entropy_loss)
 
 		self.optimizer.zero_grad()
-		loss.backward()
+		total_loss.backward()
 		self.optimizer.step()
 
-		return loss.item()
+		return total_loss.item()
