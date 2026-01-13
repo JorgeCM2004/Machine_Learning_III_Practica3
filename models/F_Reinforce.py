@@ -18,8 +18,9 @@ class Reinforce:
 			nn.ReLU(),
 			nn.Linear(256, 256),
 			nn.ReLU(),
+			nn.Linear(256, 256),
+			nn.ReLU(),
 			nn.Linear(256, self.n_actions),
-			nn.Sigmoid(),
 		).to(self.device)
 
 		self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
