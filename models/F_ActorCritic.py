@@ -1,116 +1,160 @@
+import copy
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
+
+from .F_Network import Network
 
 
 class ActorCritic:
 	def __init__(self, env, lr=1e-3, gamma=0.99):
+		"""
+		Initialize the ActorCritic model.
+
+		Args:
+			env (gym.Env): The environment to train on.
+			lr (float): Learning rate for the optimizer.
+			gamma (float): Discount factor for the future rewards.
+		"""
+		self.device = "cuda" if torch.cuda.is_available() else "cpu"
 		self.gamma = gamma
 		self.lr = lr
-		# self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-		self.device = "cpu"
 
-		# 1. EL ACTOR (Política): Decide qué hacer
-		self.obs_dim = env.observation_space.shape[0]
-		self.n_actions = env.action_space.n
+		state_dim = env.observation_space.shape[0]
+		action_dim = env.action_space.n
 
-		self.actor_net = nn.Sequential(
-			nn.Linear(self.obs_dim, 128),
-			nn.ReLU(),
-			nn.Linear(128, 64),
-			nn.ReLU(),
-			nn.Linear(64, self.n_actions),
-		).to(self.device)
+		self.actor = Network(state_dim, action_dim).to(self.device)
+		self.critic = Network(state_dim, action_dim).to(self.device)
 
-		# 2. EL CRÍTICO (Valor): Juzga qué tan bueno es el estado
-		self.critic_net = nn.Sequential(
-			nn.Linear(self.obs_dim, 128),
-			nn.ReLU(),
-			nn.Linear(128, 64),
-			nn.ReLU(),
-			nn.Linear(64, 1),  # Salida escalar (Valor)
-		).to(self.device)
+		self.critic_target = copy.deepcopy(self.critic)
+		self.critic_target.eval()
 
-		# Optimizamos ambas redes
-		all_params = list(self.actor_net.parameters()) + list(
-			self.critic_net.parameters()
-		)
-		self.optimizer = optim.Adam(all_params, lr=lr)
+		self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr)
+		self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr)
 
-		# Referencia para el guardado del modelo
-		self.policy_net = self.actor_net
+		self.loss_fn = nn.MSELoss()
+
+		self.target_update_freq = 10
+		self.update_count = 0
 
 	def act(self, state, eval_mode=False):
 		"""
-		Devuelve: acción, log_prob, valor
+		Select an action based on the current state.
+
+		Args:
+			state (np.ndarray): The current state of the environment.
+			eval_mode (bool): Whether to use evaluation mode.
+
+		Returns:
+			int: The selected action.
 		"""
-		state_t = torch.from_numpy(state).float().to(self.device)
-
-		# 1. El Actor calcula los logits
-		logits = self.actor_net(state_t)
-
-		# 2. El Crítico estima el valor
-		value = self.critic_net(state_t)
+		state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+		logits = self.actor(state)
 
 		if eval_mode:
-			# Modo evaluación (Determinista)
-			action = torch.argmax(logits).item()
-			return action, 0.0, 0.0
-		else:
-			# Modo entrenamiento (Estocástico)
-			dist = Categorical(logits=logits)
-			action = dist.sample()
-			log_prob = dist.log_prob(action)
+			return torch.argmax(logits).item()
 
-			return action.item(), log_prob, value
+		dist = Categorical(logits=logits)
+		action = dist.sample()
+		return action.item()
 
-	def update(self, log_probs, rewards, values):
+	def update(self, episode_exp):
 		"""
-		Calcula las pérdidas de Actor y Crítico y actualiza la red.
+		Update the actor and critic networks based on the episode experience.
+
+		Args:
+			episode_exp (list): List of tuples containing the episode experience.
+
+		Returns:
+			tuple: Tuple containing the actor loss and critic loss.
 		"""
-		# 1. Calcular Retornos Reales (G_t)
-		returns = []
-		G = 0
-		for r in reversed(rewards):
-			G = r + self.gamma * G
-			returns.insert(0, G)
 
-		# --- CORRECCIÓN CRÍTICA ---
-		# Convertimos a tensor especificando float32 para evitar conflictos de tipo (Double vs Float)
-		returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
+		states, actions, rewards, next_states, dones = zip(*episode_exp)
 
-		# Normalizamos retornos (Estabilidad numérica)
-		if len(returns) > 1:
-			returns = (returns - returns.mean()) / (returns.std() + 1e-9)
+		states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
+		actions = torch.tensor(np.array(actions), dtype=torch.long).to(self.device)
+		rewards = torch.tensor(np.array(rewards), dtype=torch.float32).to(self.device)
+		next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(
+			self.device
+		)
+		dones = torch.tensor(np.array(dones), dtype=torch.float32).to(self.device)
 
-		# Procesamos los valores estimados por el crítico
-		# 'values' es una lista de tensores, los concatenamos y ajustamos dimensiones
-		values = torch.cat(values).squeeze()
+		loss_critic = self._update_critic(states, actions, next_states, rewards, dones)
+		loss_actor = self._update_actor(states, actions, next_states, rewards, dones)
 
-		# 2. Calcular la VENTAJA (Advantage)
-		# A(s,a) = G_t - V(s)
-		# Usamos detach() porque el error de predicción del valor es solo para el crítico
-		advantage = returns - values.detach()
+		self.update_count += 1
+		if self.update_count % self.target_update_freq == 0:
+			self.critic_target.load_state_dict(self.critic.state_dict())
 
-		# 3. Cálculo de Pérdidas (Losses)
+		return loss_actor, loss_critic
 
-		# ACTOR LOSS: - log_prob * Ventaja
-		actor_loss = 0
-		for log_prob, adv in zip(log_probs, advantage):
-			actor_loss += -log_prob * adv
+	def _update_critic(self, state, actions, next_states, rewards, dones):
+		"""
+		Update the critic network based on the episode experience.
 
-		# CRITIC LOSS: MSE entre Valor Estimado y Retorno Real
-		# Al haber convertido 'returns' a float32, esto ya es compatible
-		critic_loss = F.mse_loss(values, returns)
+		Args:
+			state (torch.Tensor): The current state of the environment.
+			actions (torch.Tensor): The actions taken in the environment.
+			next_states (torch.Tensor): The next states of the environment.
+			rewards (torch.Tensor): The rewards received in the environment.
+			dones (torch.Tensor): The done flags for the environment.
 
-		# Loss Total
-		loss = actor_loss + critic_loss
+		Returns:
+			float: The critic loss.
+		"""
+		q_values = self.critic(state)
+		q_value = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-		# 4. Optimización
-		self.optimizer.zero_grad()
+		with torch.no_grad():
+			next_q_values = self.critic_target(next_states)
+			max_next_q = next_q_values.max(1)[0]
+			target = rewards + self.gamma * max_next_q * (1 - dones)
+
+		loss = self.loss_fn(q_value, target)
+
+		self.critic_optimizer.zero_grad()
 		loss.backward()
-		self.optimizer.step()
+		self.critic_optimizer.step()
 
-		return actor_loss.item(), critic_loss.item()
+		return loss.item()
+
+	def _update_actor(self, state, actions, next_states, rewards, dones):
+		"""
+		Update the actor network based on the episode experience.
+
+		Args:
+			state (torch.Tensor): The current state of the environment.
+			actions (torch.Tensor): The actions taken in the environment.
+			next_states (torch.Tensor): The next states of the environment.
+			rewards (torch.Tensor): The rewards received in the environment.
+			dones (torch.Tensor): The done flags for the environment.
+
+		Returns:
+			float: The actor loss.
+		"""
+		logits = self.actor(state)
+		dist = Categorical(logits=logits)
+		log_probs = dist.log_prob(actions)
+
+		with torch.no_grad():
+			q_values = self.critic(state)
+			q_current = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+
+			q_values_next = self.critic_target(next_states)
+			q_next_max = q_values_next.max(1)[0]
+
+			target_q = rewards + self.gamma * q_next_max * (1 - dones)
+			advantage = target_q - q_current
+
+		advantage = advantage.detach()
+
+		actor_loss = -(log_probs * advantage).mean()
+
+		self.actor_optimizer.zero_grad()
+		actor_loss.backward()
+		self.actor_optimizer.step()
+
+		return actor_loss.item()

@@ -7,6 +7,14 @@ from .F_Network import Network
 
 class Reinforce:
 	def __init__(self, env, lr=1e-3, gamma=0.99):
+		"""
+		Initialize the Reinforce model.
+
+		Args:
+			env (gym.Env): The environment to train on.
+			lr (float): Learning rate for the optimizer.
+			gamma (float): Discount factor for the future rewards.
+		"""
 		self.gamma = gamma
 		self.lr = lr
 		self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -19,6 +27,16 @@ class Reinforce:
 		self.optimizer = optim.Adam(self.actor.parameters(), lr=lr)
 
 	def act(self, state, eval_mode=False):
+		"""
+		Select an action based on the current state.
+
+		Args:
+			state (np.ndarray): The current state of the environment.
+			eval_mode (bool): Whether to use evaluation mode.
+
+		Returns:
+			int: The selected action.
+		"""
 		state_t = torch.from_numpy(state).float().to(self.device)
 		logits = self.actor(state_t)
 
@@ -30,6 +48,16 @@ class Reinforce:
 		return action.item(), dist.log_prob(action)
 
 	def update(self, log_probs, rewards):
+		"""
+		Update the actor network based on the episode experience.
+
+		Args:
+			log_probs (list): List of log probabilities of the actions taken.
+			rewards (list): List of rewards received in the environment.
+
+		Returns:
+			float: The actor loss.
+		"""
 		returns = []
 		G = 0
 		for r in reversed(rewards):
